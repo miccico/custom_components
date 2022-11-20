@@ -59,7 +59,7 @@ void Wiegand::loop() {
 	oparity++;
     if ((eparity & 1) || !(oparity & 1)) {
       ESP_LOGD(TAG, "invalid parity");
-      return;
+      //disabled ciko return;
     }
     for (auto *trigger : this->tag_triggers_)
       trigger->trigger(tag);
