@@ -115,19 +115,16 @@ void Wiegand::loop() {
         this->send_key_(key);
       }
     }
-  } else if (bit_count == 18) {
+  } else if (count == 18) {
 	  // Extract or check your specific 18-bit payload value matching 0x2006e (or decimal equivalent)
-	  uint32_t raw_value = ...; // Variable holding the parsed bit value from the buffer
+	  uint32_t raw_value = value;
 	
 	  // Check if the payload matches your specific message
 	  if (raw_value == 0x2006e) { 
 		ESP_LOGD("wiegand", "Detected 18-bit doorbell message: 0x2006e");
 		
 		// Option A: Fire it as key '11' (matching your previous setup)
-		this->-node_key_callback(12); 
-		
-		// Option B: Or if your component supports a custom callback/trigger for characters or events:
-		// this->node_key_callback('B'); 
+		this->send_key_(key);
 	  }
 	}
   } else {
