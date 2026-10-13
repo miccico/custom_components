@@ -1,31 +1,31 @@
 #include "wiegand.h"
-#include "esphome/core/log.h"
+#include <cinttypes>
 #include "esphome/core/helpers.h"
-
-namespace esphome {
-namespace wiegand {
-
-static const char *TAG = "wiegand.text_sensor";
-static const char *KEYS = "0123456789*#";
-
+#include "esphome/core/log.h"
+ 
+namespace esphome::wiegand {
+ 
+static const char *const TAG = "wiegand";
+static const char *const KEYS = "0123456789*#B";
+ 
 void IRAM_ATTR HOT WiegandStore::d0_gpio_intr(WiegandStore *arg) {
   if (arg->d0.digital_read())
     return;
-  arg->count++;
+  arg->count += 1;
   arg->value <<= 1;
   arg->last_bit_time = millis();
   arg->done = false;
 }
-
+ 
 void IRAM_ATTR HOT WiegandStore::d1_gpio_intr(WiegandStore *arg) {
   if (arg->d1.digital_read())
     return;
-  arg->count++;
+  arg->count += 1;
   arg->value = (arg->value << 1) | 1;
   arg->last_bit_time = millis();
   arg->done = false;
 }
-
+ 
 void Wiegand::setup() {
   this->d0_pin_->setup();
   this->store_.d0 = this->d0_pin_->to_isr();
@@ -34,7 +34,27 @@ void Wiegand::setup() {
   this->d0_pin_->attach_interrupt(WiegandStore::d0_gpio_intr, &this->store_, gpio::INTERRUPT_FALLING_EDGE);
   this->d1_pin_->attach_interrupt(WiegandStore::d1_gpio_intr, &this->store_, gpio::INTERRUPT_FALLING_EDGE);
 }
-
+ 
+bool check_eparity(uint64_t value, int start, int length) {
+  int parity = 0;
+  uint64_t mask = 1LL << start;
+  for (int i = 0; i < length; i++, mask <<= 1) {
+    if (value & mask)
+      parity++;
+  }
+  return !(parity & 1);
+}
+ 
+bool check_oparity(uint64_t value, int start, int length) {
+  int parity = 0;
+  uint64_t mask = 1LL << start;
+  for (int i = 0; i < length; i++, mask <<= 1) {
+    if (value & mask)
+      parity++;
+  }
+  return parity & 1;
+}
+ 
 void Wiegand::loop() {
   if (this->store_.done)
     return;
@@ -46,40 +66,38 @@ void Wiegand::loop() {
   this->store_.value = 0;
   this->store_.done = true;
   ESP_LOGV(TAG, "received %d-bit value: %llx", count, value);
+  for (auto *trigger : this->raw_triggers_)
+    trigger->trigger(count, value);
   if (count == 26) {
-    std::string tag = to_string((value >> 1) & 0xffffff);
-    ESP_LOGD(TAG, "received 26-bit tag: %s", tag.c_str());
-    int eparity = 0;
-    for (uint32_t i = 1 << 13; i <= (1 << 26); i <<= 1)
-      if (value & i)
-	eparity++;
-    int oparity = 0;
-    for (uint32_t i = 1; i <= (1 << 12); i <<= 1)
-      if (value & i)
-	oparity++;
-    if ((eparity & 1) || !(oparity & 1)) {
-      ESP_LOGD(TAG, "invalid parity");
-      //disabled ciko return;
-    }
-    for (auto *trigger : this->tag_triggers_)
-      trigger->trigger(tag);
-  } else if (count == 34) {
-    std::string tag = to_string((value >> 1) & 0xffffffff);
-    ESP_LOGD(TAG, "received 34-bit tag: %s", tag.c_str());
-    int eparity = 0;
-    for (uint64_t i = 1 << 17; i <= (1LL << 33); i <<= 1)
-      if (value & i)
-	eparity++;
-    int oparity = 0;
-    for (uint64_t i = 1; i <= (1 << 16); i <<= 1)
-      if (value & i)
-	oparity++;
-    if ((eparity & 1) || !(oparity & 1)) {
-      ESP_LOGD(TAG, "invalid parity");
+    char tag_buf[12];  // max 8 digits for 24-bit value + null
+    buf_append_printf(tag_buf, sizeof(tag_buf), 0, "%" PRIu32, static_cast<uint32_t>((value >> 1) & 0xffffff));
+    ESP_LOGD(TAG, "received 26-bit tag: %s", tag_buf);
+    if (!check_eparity(value, 13, 13) || !check_oparity(value, 0, 13)) {
+      ESP_LOGW(TAG, "invalid parity");
       return;
     }
     for (auto *trigger : this->tag_triggers_)
-      trigger->trigger(tag);
+      trigger->trigger(tag_buf);
+  } else if (count == 34) {
+    char tag_buf[12];  // max 10 digits for 32-bit value + null
+    buf_append_printf(tag_buf, sizeof(tag_buf), 0, "%" PRIu32, static_cast<uint32_t>((value >> 1) & 0xffffffff));
+    ESP_LOGD(TAG, "received 34-bit tag: %s", tag_buf);
+    if (!check_eparity(value, 17, 17) || !check_oparity(value, 0, 17)) {
+      ESP_LOGW(TAG, "invalid parity");
+      return;
+    }
+    for (auto *trigger : this->tag_triggers_)
+      trigger->trigger(tag_buf);
+  } else if (count == 37) {
+    char tag_buf[12];  // max 11 digits for 35-bit value + null
+    buf_append_printf(tag_buf, sizeof(tag_buf), 0, "%" PRIu64, static_cast<uint64_t>((value >> 1) & 0x7ffffffff));
+    ESP_LOGD(TAG, "received 37-bit tag: %s", tag_buf);
+    if (!check_eparity(value, 18, 19) || !check_oparity(value, 0, 19)) {
+      ESP_LOGW(TAG, "invalid parity");
+      return;
+    }
+    for (auto *trigger : this->tag_triggers_)
+      trigger->trigger(tag_buf);
   } else if (count == 4) {
     for (auto *trigger : this->key_triggers_)
       trigger->trigger(value);
@@ -87,16 +105,40 @@ void Wiegand::loop() {
       uint8_t key = KEYS[value];
       this->send_key_(key);
     }
+  } else if (count == 8) {
+    if ((value ^ 0xf0) >> 4 == (value & 0xf)) {
+      value &= 0xf;
+      for (auto *trigger : this->key_triggers_)
+        trigger->trigger(value);
+      if (value < 12) {
+        uint8_t key = KEYS[value];
+        this->send_key_(key);
+      }
+    }
+  } else if (bit_count == 18) {
+	  // Extract or check your specific 18-bit payload value matching 0x2006e (or decimal equivalent)
+	  uint32_t raw_value = ...; // Variable holding the parsed bit value from the buffer
+	
+	  // Check if the payload matches your specific message
+	  if (raw_value == 0x2006e) { 
+		ESP_LOGD("wiegand", "Detected 18-bit doorbell message: 0x2006e");
+		
+		// Option A: Fire it as key '11' (matching your previous setup)
+		this->-node_key_callback(12); 
+		
+		// Option B: Or if your component supports a custom callback/trigger for characters or events:
+		// this->node_key_callback('B'); 
+	  }
+	}
   } else {
     ESP_LOGD(TAG, "received unknown %d-bit value: %llx", count, value);
   }
 }
-
+ 
 void Wiegand::dump_config() {
   ESP_LOGCONFIG(TAG, "Wiegand reader:");
   LOG_PIN("  D0 pin: ", this->d0_pin_);
   LOG_PIN("  D1 pin: ", this->d1_pin_);
 }
-
-}  // namespace wiegand
-}  // namespace esphome
+ 
+}  // namespace esphome::wiegand
